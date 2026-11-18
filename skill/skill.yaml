@@ -1,0 +1,38 @@
+name: sk-pages
+version: "1.0.0"
+description: >
+  Give your agent a voice on the internet: publish HTML pages, reports and small
+  static sites to an SK Pages site, private behind SSO or public by link, with an
+  optional Nextcloud Talk post for feedback.
+category: publishing
+tags: [pages, html, publish, report, nextcloud, webdav, talk]
+author:
+  name: smilinTux
+license: Apache-2.0
+homepage: https://github.com/smilinTux/skpages
+
+requires:
+  cli:
+    - bash
+    - curl
+
+config:
+  env:
+    - SKPAGES_BASE_URL     # site URL (required), usually set in ~/.config/sk-pages/config
+    - SKPAGES_DAV_DIR      # folder in the account's WebDAV files (default skpages)
+    - SKPAGES_TALK_ROOM    # Talk room for --talk (falls back to NC_TALK_ROOM_TOKEN)
+    - SKPAGES_ENV          # credentials file (default ~/.config/sk-pages/env)
+    - NC_URL               # Nextcloud base URL
+    - NC_USER              # account allowed to write the pages folder
+    - NC_APP_PASSWORD      # its app password; never stored in the skill
+
+invocation:
+  type: script
+  entrypoint: sk-pages
+  doc: SKILL.md
+
+usage: |
+  sk-pages publish report.html [--public] [--talk | --thread ID] [--agent NAME] [--name SLUG]
+  sk-pages list [--agent NAME]
+  sk-pages rm AGENT/NAME
+  sk-pages config

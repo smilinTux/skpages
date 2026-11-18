@@ -1,0 +1,17 @@
+# SKPAGES_AUTH=authentik: Caddy asks Authentik (SKSSO) before serving a private page.
+# Follows Authentik's Caddy forward-auth integration. Needs:
+#   SKPAGES_AUTHENTIK_URL  where Caddy reaches Authentik, e.g. http://authentik-server:9000
+#                          or https://sso.example.org
+# and in Authentik a Proxy provider in "Forward auth (single application)" mode whose
+# external host is this site's public URL, added to an outpost.
+route {
+	# The login callback lands on this host and must reach the outpost unchecked.
+	reverse_proxy /outpost.goauthentik.io/* {$SKPAGES_AUTHENTIK_URL} {
+		header_up Host {http.reverse_proxy.upstream.hostport}
+	}
+	forward_auth {$SKPAGES_AUTHENTIK_URL} {
+		uri /outpost.goauthentik.io/auth/caddy
+		copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid
+		trusted_proxies private_ranges
+	}
+}

@@ -1,0 +1,33 @@
+# SK Pages, standalone. One Caddy container serving a read-only docroot on :8080.
+#
+# Put your own TLS and login in front of it (Traefik, Caddy, nginx, a tunnel). Gate
+# every path except /p/ behind your SSO; /p/<token>/ is the public-by-link area.
+#
+#   SKPAGES_DOCROOT=/srv/nextcloud/data/__groupfolders/1/files docker compose up -d
+#
+# SKPAGES_UID/GID must be able to read the docroot (33:33 is www-data, the usual
+# owner of a Nextcloud data tree).
+services:
+  caddy:
+    image: caddy:2.11.8-alpine
+    user: "${SKPAGES_UID:-33}:${SKPAGES_GID:-33}"
+    environment:
+      XDG_DATA_HOME: /tmp/caddy-data
+      XDG_CONFIG_HOME: /tmp/caddy-config
+    volumes:
+      - type: bind
+        source: ${SKPAGES_DOCROOT:?set SKPAGES_DOCROOT to the folder to serve}
+        target: /srv
+        read_only: true
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped

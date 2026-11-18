@@ -1,0 +1,2 @@
+# SKPAGES_AUTH=none: no login check in Caddy. Use only when something in front of
+# Caddy already decides who gets in (Traefik with SSO, or a tailnet-only serve).

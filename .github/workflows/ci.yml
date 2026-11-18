@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["skpages-v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck skill/sk-pages install.sh tests/*.sh
+
+  test-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: CLI against the mock Nextcloud
+        run: tests/test_cli.sh
+
+  test-caddy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Caddy rules against the real image (both auth modes)
+        run: tests/test_caddy.sh
+
+  scrub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write operator denylist (from secret, never committed)
+        env:
+          DENYLIST: ${{ secrets.SCRUB_DENYLIST }}
+        run: |
+          if [ -n "$DENYLIST" ]; then
+            printf '%s\n' "$DENYLIST" > "$RUNNER_TEMP/denylist.txt"
+            echo "SKPAGES_SCRUB_DENYLIST=$RUNNER_TEMP/denylist.txt" >> "$GITHUB_ENV"
+          fi
+      - name: Scrub (release tags fail closed without the denylist)
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then tests/scrub.sh --release; else tests/scrub.sh; fi
+
+  docs:
+    uses: smilinTux/sk-standards/.github/workflows/docs-check.yml@3249adb2011737f7bb82aa5cb1bde3ca45f6067b

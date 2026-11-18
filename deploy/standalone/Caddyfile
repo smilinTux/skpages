@@ -1,0 +1,79 @@
+# SK Pages Caddyfile, standalone version.
+#
+# The SKStacks role renders the same rules from a template. Keep the two in step:
+# tests/test_caddy.sh checks the behaviour of this file.
+#
+# Caddy serves files on plain HTTP :8080 and never touches certificates: TLS comes
+# from whatever is in front (Traefik, tailscale serve or funnel, another proxy).
+# The docroot is mounted read-only: nothing that reaches this server can change
+# a page.
+{
+	admin off
+	auto_https off
+	persist_config off
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+:{$SKPAGES_PORT:8080} {
+	root * /srv
+
+	# Pages are agent-written HTML on their own origin. The policy below lets a
+	# page run its own inline script and pull from the usual CDNs, but it cannot
+	# send data anywhere (connect-src/form-action), cannot be framed by another
+	# site, and cannot rewrite its base URL.
+	header {
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: blob: https:; media-src 'self' data: blob:; connect-src 'self'; form-action 'none'; frame-ancestors 'self'; base-uri 'self'; object-src 'none'"
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+		Cross-Origin-Opener-Policy "same-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		-Server
+	}
+
+	# Caddy runs `handle` before `respond`, so every rule here is a handle
+	# block. Blocks are mutually exclusive and tried in the order written:
+	# the deny rules must stay above the file servers.
+	@health path /healthz
+	handle @health {
+		respond "ok" 200
+	}
+
+	# Never serve dotfiles or half-finished WebDAV uploads.
+	@hidden path */.* *.part
+	handle @hidden {
+		respond 404
+	}
+
+	# /p/<token>/... is the public area. It must not be listable, or the
+	# random tokens that make a page "public by link only" leak.
+	@pubroot path /p /p/
+	handle @pubroot {
+		respond 404
+	}
+
+	@public path /p/*
+	handle @public {
+		file_server {
+			hide .* *.part
+		}
+	}
+
+	# Everything else is private. Who checks the login depends on how the site is
+	# exposed (SKPAGES_AUTH):
+	#   none       something in front already does (Traefik + SSO, or a tailnet)
+	#   authentik  this Caddy asks Authentik itself (public exposure, e.g. Funnel)
+	handle {
+		import auth/{$SKPAGES_AUTH:none}.caddy
+		file_server {
+			browse
+			hide .* *.part
+		}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

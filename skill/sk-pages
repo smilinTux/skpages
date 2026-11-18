@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# sk-pages: give your agent a voice on the internet. Publish HTML pages,
+# reports and small static sites to an SK Pages site and get a link back.
+#
+# Pages are uploaded over WebDAV (usually a Nextcloud folder) into the docroot a
+# read-only web server serves. One copy, versioned and backed up where it lives.
+#
+#   sk-pages init                         create the skpages folders
+#   sk-pages publish FILE|DIR [opts]      upload, print the link
+#       --agent NAME   folder to publish under (default: $SKAGENT, else $USER)
+#       --name SLUG    page name (default: file or dir name)
+#       --public       publish under /p/<random>/ (no login needed)
+#       --talk         post the link in Talk, room $SKPAGES_TALK_ROOM (else
+#                      $NC_TALK_ROOM_TOKEN). Starts a thread "Page: NAME".
+#       --talk-room T  same, in room token T
+#       --thread ID    post into an existing Talk thread instead (implies --talk)
+#   sk-pages list [--agent NAME]          list an agent's pages
+#   sk-pages rm AGENT/NAME | p/TOKEN/NAME remove a page
+#   sk-pages config                       show the settings in effect (no secrets)
+#   sk-pages --version
+#
+# Settings (environment wins over the config file):
+#   ~/.config/sk-pages/config   KEY=VALUE, no secrets ($SKPAGES_CONFIG overrides)
+#   SKPAGES_BASE_URL   site URL, e.g. https://pages.example.org (required)
+#   SKPAGES_PUBLIC_BASE_URL  URL for --public links when they are served from a
+#                      different address (e.g. a Tailscale Funnel port); default:
+#                      SKPAGES_BASE_URL
+#   SKPAGES_DAV_DIR    folder in the account's WebDAV files (default: skpages)
+#   SKPAGES_TALK_ROOM  Talk room token for --talk (falls back to NC_TALK_ROOM_TOKEN)
+#   SKPAGES_ENV        credentials file (default: ~/.config/sk-pages/env)
+# Credentials: NC_URL, NC_USER, NC_APP_PASSWORD (a Nextcloud account allowed to
+# write the folder). Read from the environment, else from SKPAGES_ENV.
+#
+# stdout is only the page URL, so `url=$(sk-pages publish ...)` works. Talk
+# status goes to stderr; a failed Talk post warns but does not fail the publish.
+set -euo pipefail
+
+SKPAGES_VERSION=1.0.0
+
+die() { echo "sk-pages: $*" >&2; exit 1; }
+
+source_keep_env() {  # source FILE, but variables already set in the environment win
+    local f="$1" line key
+    [ -r "$f" ] || die "file not readable: $f"
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        case "$line" in ''|'#'*) continue ;; esac
+        line="${line#export }"
+        key="${line%%=*}"
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        [ -n "${!key+x}" ] && continue
+        local val="${line#*=}"
+        val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
+        printf -v "$key" '%s' "$val"
+        export "${key?}"
+    done <"$f"
+}
+
+load_settings() {
+    local cfg="${SKPAGES_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/sk-pages/config}"
+    [ -f "$cfg" ] && source_keep_env "$cfg"
+    BASE_URL="${SKPAGES_BASE_URL:-}"
+    BASE_URL="${BASE_URL%/}"
+    PUBLIC_BASE_URL="${SKPAGES_PUBLIC_BASE_URL:-$BASE_URL}"
+    PUBLIC_BASE_URL="${PUBLIC_BASE_URL%/}"
+    DAV_DIR="${SKPAGES_DAV_DIR:-skpages}"
+    STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/sk-pages"
+}
+
+load_env() {
+    load_settings
+    if [ -z "${NC_APP_PASSWORD:-}" ]; then
+        local f="${SKPAGES_ENV:-$STATE_DIR/env}"
+        [ -f "$f" ] && source_keep_env "$f"
+    fi
+    [ -n "${NC_URL:-}" ] || die "NC_URL not set (environment or credentials file)"
+    [ -n "${NC_USER:-}" ] || die "NC_USER not set (environment or credentials file)"
+    [ -n "${NC_APP_PASSWORD:-}" ] || die "NC_APP_PASSWORD not set (environment or credentials file)"
+    [ -n "$BASE_URL" ] || die "SKPAGES_BASE_URL not set (e.g. in ~/.config/sk-pages/config)"
+    DAV_ROOT="${NC_URL%/}/remote.php/dav/files/$(urlenc "$NC_USER")/$(urlenc_path "$DAV_DIR")"
+}
+
+cmd_config() {
+    load_settings
+    local f="${SKPAGES_ENV:-$STATE_DIR/env}"
+    printf 'version          %s\n' "$SKPAGES_VERSION"
+    printf 'base url         %s\n' "${BASE_URL:-(not set)}"
+    printf 'public base url  %s\n' "${PUBLIC_BASE_URL:-(not set)}"
+    printf 'dav dir          %s\n' "$DAV_DIR"
+    printf 'talk room        %s\n' "${SKPAGES_TALK_ROOM:-${NC_TALK_ROOM_TOKEN:-(not set)}}"
+    local creds="(none found)"
+    if [ -n "${NC_APP_PASSWORD:-}" ]; then creds=environment; elif [ -f "$f" ]; then creds="$f"; fi
+    printf 'credentials      %s\n' "$creds"
+}
+
+urlenc() {
+    local LC_ALL=C s="$1" out="" c i
+    for ((i = 0; i < ${#s}; i++)); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9._~-]) out+="$c" ;;
+            *) out+=$(printf '%%%02X' "'$c") ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+urlenc_path() {
+    local IFS=/ part out=""
+    for part in $1; do
+        [ -n "$part" ] && out+="${out:+/}$(urlenc "$part")"
+    done
+    printf '%s' "$out"
+}
+
+slug() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/\.html?$//; s/[^a-z0-9]+/-/g; s/^-+|-+$//g'
+}
+
+# curl with credentials passed on a config fd, never on the command line.
+dav() {
+    curl -sS --fail-with-body -K <(printf 'user = "%s:%s"\n' "$NC_USER" "$NC_APP_PASSWORD") "$@"
+}
+
+mkcol() {
+    local code
+    code=$(dav -o /dev/null -w '%{http_code}' -X MKCOL "$1" 2>/dev/null || true)
+    case "$code" in
+        201|405) ;;  # created, or already there
+        *) die "MKCOL $1 failed (HTTP $code)" ;;
+    esac
+}
+
+mkcol_p() {  # create each level of a relative path under DAV_ROOT
+    local IFS=/ part acc="$DAV_ROOT"
+    for part in $1; do
+        [ -n "$part" ] || continue
+        acc+="/$(urlenc "$part")"
+        mkcol "$acc"
+    done
+}
+
+exists() {  # exists REL: 0 when the path is already in the folder
+    [ "$(dav -o /dev/null -w '%{http_code}' -X PROPFIND -H 'Depth: 0' "$DAV_ROOT/$(urlenc_path "$1")/" 2>/dev/null || true)" = 207 ]
+}
+
+talk_send() {  # talk_send ROOM MESSAGE [THREAD_ID] [THREAD_TITLE]; prints the JSON reply
+    local args=(--data-urlencode "message=$2")
+    if [ -n "${3:-}" ]; then
+        args+=(--data-urlencode "threadId=$3")
+    elif [ -n "${4:-}" ]; then
+        args+=(--data-urlencode "threadTitle=$4")
+    fi
+    dav -X POST -H 'OCS-APIRequest: true' -H 'Accept: application/json' "${args[@]}" \
+        "${NC_URL%/}/ocs/v2.php/apps/spreed/api/v1/chat/$(urlenc "$1")"
+}
+
+talk_post() {  # talk_post ROOM MESSAGE THREAD_ID THREAD_TITLE
+    local out tid
+    if ! out=$(talk_send "$@" 2>/dev/null); then
+        # A thread whose root was deleted makes Talk answer 400: start a new one.
+        if [ -n "$3" ] && out=$(talk_send "$1" "$2" "" "$4" 2>/dev/null); then
+            echo "sk-pages: thread $3 not usable, started a new one" >&2
+        else
+            echo "sk-pages: Talk post to $1 failed (the page is published)" >&2
+            return 0
+        fi
+    fi
+    tid=$(printf '%s' "$out" | grep -o '"threadId": *[0-9]*' | head -n1 | tr -dc 0-9)
+    echo "sk-pages: link posted in Talk room $1${tid:+, thread $tid}" >&2
+}
+
+put() {  # put LOCAL REL
+    dav -o /dev/null -T "$1" "$DAV_ROOT/$(urlenc_path "$2")" || die "upload failed: $2"
+}
+
+token_for() {  # stable random token per agent/name, so republishing keeps the link
+    local key="$1" f="$STATE_DIR/public-tokens" t
+    mkdir -p "$STATE_DIR"
+    touch "$f"; chmod 600 "$f"
+    t=$(awk -v k="$key" '$1 == k { print $2 }' "$f" | tail -n1)
+    if [ -z "$t" ]; then
+        t=$(head -c 18 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')
+        printf '%s %s\n' "$key" "$t" >>"$f"
+    fi
+    printf '%s' "$t"
+}
+
+cmd_init() {
+    mkcol "$DAV_ROOT"
+    mkcol "$DAV_ROOT/p"
+    echo "ready: $DAV_DIR (served at $BASE_URL/)"
+}
+
+cmd_publish() {
+    local src="" agent="${SKAGENT:-${USER:-agent}}" name="" public=0
+    local talk=0 room="${SKPAGES_TALK_ROOM:-${NC_TALK_ROOM_TOKEN:-}}" thread=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --agent) agent="$2"; shift 2 ;;
+            --name) name="$2"; shift 2 ;;
+            --public) public=1; shift ;;
+            --talk) talk=1; shift ;;
+            --talk-room) talk=1; room="$2"; shift 2 ;;
+            --thread) talk=1; thread="$2"; shift 2 ;;
+            -*) die "unknown option: $1" ;;
+            *) [ -z "$src" ] || die "one FILE or DIR only"; src="$1"; shift ;;
+        esac
+    done
+    [ -n "$src" ] || die "usage: sk-pages publish FILE|DIR [--agent NAME] [--name SLUG] [--public]"
+    [ -e "$src" ] || die "not found: $src"
+    [ "$talk" = 0 ] || [ -n "$room" ] || die "--talk needs a room: --talk-room TOKEN or SKPAGES_TALK_ROOM"
+    agent=$(slug "$agent"); [ -n "$agent" ] || die "empty agent name"
+    name=$(slug "${name:-$(basename "${src%/}")}"); [ -n "$name" ] || die "empty page name"
+
+    local rel
+    if [ "$public" = 1 ]; then
+        rel="p/$(token_for "$agent/$name")/$name"
+    else
+        rel="$agent/$name"
+    fi
+    local verb=Published
+    exists "$rel" && verb=Updated
+    mkcol_p "$rel"
+
+    if [ -f "$src" ]; then
+        put "$src" "$rel/index.html"
+    else
+        [ -f "$src/index.html" ] || die "$src has no index.html"
+        local f d
+        while IFS= read -r -d '' d; do
+            mkcol_p "$rel/${d#"$src"/}"
+        done < <(find "$src" -mindepth 1 -type d ! -path '*/.*' -print0)
+        while IFS= read -r -d '' f; do
+            put "$f" "$rel/${f#"$src"/}"
+        done < <(find "$src" -type f ! -path '*/.*' -print0)
+    fi
+    local url="$BASE_URL/$rel/"
+    [ "$public" = 1 ] && url="$PUBLIC_BASE_URL/$rel/"
+    echo "$url"
+    if [ "$talk" = 1 ]; then
+        talk_post "$room" "$verb page: $name"$'\n'"$url" "$thread" "Page: $name"
+    fi
+}
+
+cmd_list() {
+    local agent="${SKAGENT:-${USER:-agent}}"
+    [ "${1:-}" = "--agent" ] && agent="$2"
+    agent=$(slug "$agent")
+    dav -X PROPFIND -H 'Depth: 1' "$DAV_ROOT/$agent/" \
+        | grep -io '<[a-z]*:href>[^<]*</[a-z]*:href>' | sed -E 's#</?[A-Za-z]*:href>##g' | tail -n +2 \
+        | sed -E "s#^.*/$agent/#$BASE_URL/$agent/#"
+}
+
+cmd_rm() {
+    local rel="${1:?usage: sk-pages rm AGENT/NAME}"
+    case "$rel" in */*) ;; *) die "give AGENT/NAME or p/TOKEN/NAME" ;; esac
+    dav -o /dev/null -X DELETE "$DAV_ROOT/$(urlenc_path "$rel")/" || die "delete failed: $rel"
+    echo "removed: $rel"
+}
+
+main() {
+    local cmd="${1:-}"; shift || true
+    case "$cmd" in
+        init) load_env; cmd_init ;;
+        publish) load_env; cmd_publish "$@" ;;
+        list) load_env; cmd_list "$@" ;;
+        rm) load_env; cmd_rm "$@" ;;
+        config) cmd_config ;;
+        -V|--version|version) echo "sk-pages $SKPAGES_VERSION" ;;
+        -h|--help|help|"") awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
+        *) die "unknown command: $cmd (try --help)" ;;
+    esac
+}
+
+main "$@"
